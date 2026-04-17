@@ -246,6 +246,80 @@ def optimize_portfolio(results):
 
 # ── 综合评分 ───────────────────────────────────────────────────────────
 
+
+def optimize_portfolio_multi(results, money_fund_ratio=0.10):
+    """
+    Mean-Variance 组合优化（最大夏普）
+    money_fund_ratio: 货币基金最低配置比例（0=激进, 0.05=5%, 0.10=10%, 0.20=稳健）
+    """
+    try:
+        from scipy.optimize import minimize
+    except ImportError:
+        return []
+
+    valid = []
+    for r in results:
+        m = r.get('metrics', {})
+        if m and m.get('annualized', 0) > -50 and m.get('volatility', 0) > 0:
+            valid.append({
+                'code': r['code'], 'name': r['name'],
+                'ret': m['annualized'] / 100,
+                'vol': m['volatility'] / 100,
+                'is_money': r.get('fund_type') == 'money',
+                'weight': 0,
+            })
+
+    # 如果没有货币基金，用估算收益率注入
+    has_money = any(v['is_money'] for v in valid)
+    if not has_money:
+        valid.append({'code': 'MONEY', 'name': '货币基金(建议配置)', 'ret': 0.0165, 'vol': 0.001, 'is_money': True, 'weight': 0})
+
+    n = len(valid)
+    rets = np.array([v['ret'] for v in valid])
+    vols = np.array([v['vol'] for v in valid])
+    cov = np.diag(vols ** 2)
+    money_idx = next((i for i, v in enumerate(valid) if v['is_money']), None)
+
+    def run_opt(min_money):
+        def neg_sharpe(w):
+            pr = float(w @ rets)
+            pv = float(np.sqrt(w @ cov @ w + 1e-8))
+            return -(pr - 0.03) / pv if pv > 1e-6 else 0
+        bounds = [(0.0, 1.0)] * n
+        if money_idx is not None and min_money > 0:
+            bounds[money_idx] = (min_money, 1.0)
+        cons = {'type': 'eq', 'fun': lambda w: float(sum(w)) - 1}
+        w0 = np.ones(n) / n
+        if money_idx is not None:
+            w0[money_idx] = min_money
+        res = minimize(neg_sharpe, w0, method='SLSQP', bounds=bounds, constraints=cons)
+        if res.success:
+            w = res.x
+            opt_ret = float(w @ rets)
+            opt_vol = float(np.sqrt(w @ cov @ w + 1e-8))
+            opt_sharpe = (opt_ret - 0.03) / opt_vol if opt_vol > 1e-6 else 0
+            for i, v in enumerate(valid):
+                v['weight'] = round(float(w[i]) * 100, 1)
+            weights = sorted(valid, key=lambda x: x['weight'], reverse=True)
+            return {
+                'min_money': min_money,
+                'label': '激进(0%货基)' if min_money == 0 else ('5%货币基金' if min_money == 0.05 else ('10%货币基金' if min_money == 0.10 else ('15%货币基金' if min_money == 0.15 else '20%稳健'))),
+                'expected_return': round(opt_ret * 100, 2),
+                'expected_volatility': round(opt_vol * 100, 2),
+                'expected_sharpe': round(opt_sharpe, 2),
+                'weights': [{'name': v['name'][:14], 'weight': v['weight'], 'code': v['code']} for v in weights if v['weight'] > 0.3],
+            }
+        return None
+
+    configs = [0, 0.05, 0.10, 0.15, 0.20]
+    results_list = []
+    for cfg in configs:
+        r = run_opt(cfg)
+        if r:
+            results_list.append(r)
+    return results_list
+
+
 def score_fund(metrics, fee, rank):
     score = 50
     if metrics:
@@ -363,8 +437,28 @@ def generate_report(results, opt, north_flow):
         lines.append("| " + r['name'][:10] + " | " + mng + " | " + reed + " | " + total + " | " + net + " |")
     lines.append("")
 
-    # 组合优化
-    if opt.get('success'):
+    # 组合优化（多版本对比）
+    multi_results = opt if isinstance(opt, list) else []
+    if multi_results:
+        lines.append("## 四、组合优化对比（Mean-Variance 最大夏普）")
+        lines.append("")
+        lines.append("| 方案 | 货基占比 | 预期收益 | 波动率 | 夏普比率 |")
+        lines.append("|------|---------|---------|--------|---------|")
+        for r in multi_results:
+            money_pct = str(int(r['min_money'] * 100)) + '%'
+            lines.append("| **" + r['label'] + "** | " + money_pct + " | " + str(r['expected_return']) + "% | " + str(r['expected_volatility']) + "% | " + str(r['expected_sharpe']) + " |")
+        lines.append("")
+
+        # 默认选10%方案详细展示
+        default_plan = next((r for r in multi_results if r['min_money'] == 0.10), multi_results[0])
+        lines.append("**建议方案：" + default_plan['label'] + "**")
+        lines.append("")
+        lines.append("| 基金 | 建议仓位 |")
+        lines.append("|------|---------|")
+        for v in default_plan['weights']:
+            lines.append("| " + v['name'][:14] + " | **" + str(v['weight']) + "%** |")
+        lines.append("")
+    elif opt.get('success'):
         lines.append("## 四、组合优化（Mean-Variance 最大夏普）")
         lines.append("")
         lines.append("**预期组合收益：** " + str(opt['expected_return']) + "%/年")
@@ -423,6 +517,7 @@ def main():
     p.add_argument('--codes', type=str)
     p.add_argument('--all', action='store_true')
     p.add_argument('--rank-period', type=str, default='今年来')
+    p.add_argument('--money-fund', type=str, default='10', help='货币基金最低配置比例（0/5/10/15/20），默认10')
     args = p.parse_args()
 
     if args.all:
@@ -441,7 +536,23 @@ def main():
     print("北向资金: " + north_flow.get('trend', 'unknown') + " " + str(north_flow.get('today', 0)) + "亿", file=sys.stderr)
 
     results = [analyze_single(h['code'], h['name'], args.rank_period) for h in portfolio]
-    opt = optimize_portfolio(results)
+    # 使用多版本组合优化（含货币基金约束）
+    money_ratio = 0.10  # 默认10%货币基金
+    if hasattr(args, 'money_fund'):
+        try:
+            money_ratio = float(args.money_fund) / 100 if args.money_fund else 0.10
+        except:
+            money_ratio = 0.10
+    # 构建含货币基金的portfolio
+    money_portfolio = list(portfolio)
+    if not any('货币' in str(h) or h.get('code') == '003538' for h in money_portfolio):
+        money_portfolio.append({'code': '003538', 'name': '招商招利宝货币B', 'is_money': True})
+    money_results = [analyze_single(h['code'], h['name'], args.rank_period) if h.get('code') != '003538'
+                     else {'code': '003538', 'name': '招商招利宝货币B', 'fund_type': 'money',
+                           'metrics': {'annualized': 1.65, 'volatility': 0.1},
+                           'today_change': 0, 'rank': {}, 'fee': {}, 'net_annualized': 1.65, 'score': 60, 'label': '建议持有'}
+                     for h in money_portfolio]
+    opt = optimize_portfolio_multi(money_results, money_fund_ratio=money_ratio)
     print(generate_report(results, opt, north_flow))
 
 if __name__ == '__main__':
